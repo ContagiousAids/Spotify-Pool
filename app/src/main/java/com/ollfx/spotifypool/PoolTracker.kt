@@ -141,7 +141,7 @@ object PoolTracker {
             }
         }
 
-        return ShotPlan(
+        val basePlan = ShotPlan(
             tableRect = table,
             pockets = pockets,
             ballRadius = radius,
@@ -157,6 +157,78 @@ object PoolTracker {
             frameWidth = w,
             frameHeight = h
         )
+
+        // Calculate a geometrically valid pot using the physics engine.
+        val engineBalls = balls.mapIndexed { index, ball ->
+            PoolEngineBall(
+                id = index,
+                center = PoolEnginePoint(ball.center.x, ball.center.y),
+                radius = ball.radius,
+                isCueBall = ball.isCueBall
+            )
+        }
+
+        val enginePockets = pockets.mapIndexed { index, pocket ->
+            PoolEnginePocket(
+                id = index,
+                center = PoolEnginePoint(pocket.x, pocket.y),
+                captureRadius = radius * 2.2f
+            )
+        }
+
+        val cueIndex = balls.indexOfFirst { it.isCueBall }
+        val physicsShot = if (cueIndex >= 0) {
+            PoolPhysicsEngine().calculateBestShot(
+                table = PoolEngineRect(
+                    table.left, table.top, table.right, table.bottom
+                ),
+                balls = engineBalls,
+                pockets = enginePockets,
+                cueBallId = cueIndex
+            )
+        } else null
+
+        // Keep the existing tracker paths if no valid pot is found.
+        return physicsShot?.let { shot ->
+            val target = balls.getOrNull(shot.targetBallId)
+
+            basePlan.copy(
+                angleDeg = target?.let {
+                    Math.toDegrees(
+                        atan2(
+                            shot.contactPoint.y - cue!!.center.y,
+                            shot.contactPoint.x - cue.center.x
+                        ).toDouble()
+                    ).toFloat()
+                } ?: basePlan.angleDeg,
+                powerRatio = shot.estimatedPower,
+                cueSegments = shot.cuePath.map {
+                    TrajectorySegment(
+                        Vec2(it.start.x, it.start.y),
+                        Vec2(it.end.x, it.end.y),
+                        false
+                    )
+                },
+                impactPoint = Vec2(
+                    shot.contactPoint.x, shot.contactPoint.y
+                ),
+                hitBall = target,
+                deflectedCueSegments = shot.deflectedCuePath.map {
+                    TrajectorySegment(
+                        Vec2(it.start.x, it.start.y),
+                        Vec2(it.end.x, it.end.y),
+                        false
+                    )
+                },
+                objectSegments = shot.objectPath.mapIndexed { index, segment ->
+                    TrajectorySegment(
+                        Vec2(segment.start.x, segment.start.y),
+                        Vec2(segment.end.x, segment.end.y),
+                        shot.bankCount > 0 && index == 0
+                    )
+                }
+            )
+        } ?: basePlan
     }
 
     private fun findTable(bitmap: Bitmap, step: Int): RectF {
