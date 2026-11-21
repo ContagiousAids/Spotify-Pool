@@ -308,83 +308,138 @@ class CaptureService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+
     private inner class TrajectoryOverlayView(context: Context) : View(context) {
         private val cueSolidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
-            strokeWidth = 6f
+            strokeWidth = 3f
             style = Paint.Style.STROKE
         }
+
         private val cueBouncePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.CYAN
-            strokeWidth = 5f
-            style = Paint.Style.STROKE
-            pathEffect = DashPathEffect(floatArrayOf(18f, 10f), 0f)
-        }
-        private val objectAimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.YELLOW
-            strokeWidth = 6f
-            style = Paint.Style.STROKE
-        }
-        private val pocketRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.GREEN
-            strokeWidth = 3.5f
-            style = Paint.Style.STROKE
-        }
-        private val ballMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(180, 0, 255, 180)
             strokeWidth = 2.5f
             style = Paint.Style.STROKE
+            pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
         }
-        private val ghostBallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            strokeWidth = 4f
+
+        private val objectAimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.YELLOW
+            strokeWidth = 3f
             style = Paint.Style.STROKE
         }
+
+        private val pocketRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.GREEN
+            strokeWidth = 2f
+            style = Paint.Style.STROKE
+        }
+
+        private val ballMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(190, 0, 255, 180)
+            strokeWidth = 2f
+            style = Paint.Style.STROKE
+        }
+
+        private val ghostBallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            strokeWidth = 3f
+            style = Paint.Style.STROKE
+        }
+
         private val hudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
-            textSize = 32f
+            textSize = 22f
+            setShadowLayer(4f, 1f, 1f, Color.BLACK)
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
             val plan = latestPlan ?: return
+            if (plan.frameWidth <= 0 || plan.frameHeight <= 0) return
+
+            val save = canvas.save()
+
+            val scaleX = width.toFloat() / plan.frameWidth.toFloat()
+            val scaleY = height.toFloat() / plan.frameHeight.toFloat()
+            canvas.scale(scaleX, scaleY)
 
             for (ball in plan.balls) {
-                canvas.drawCircle(ball.center.x, ball.center.y, ball.radius + 3f, ballMarkerPaint)
+                canvas.drawCircle(
+                    ball.center.x,
+                    ball.center.y,
+                    ball.radius + 2f,
+                    ballMarkerPaint
+                )
             }
 
             for (pocket in plan.pockets) {
-                canvas.drawCircle(pocket.x, pocket.y, plan.ballRadius * 1.4f, pocketRingPaint)
+                canvas.drawCircle(
+                    pocket.x,
+                    pocket.y,
+                    plan.ballRadius * 1.4f,
+                    pocketRingPaint
+                )
             }
 
-            for (seg in plan.cueSegments) {
-                val paint = if (seg.isRailBounce) cueBouncePaint else cueSolidPaint
-                canvas.drawLine(seg.start.x, seg.start.y, seg.end.x, seg.end.y, paint)
+            for (segment in plan.cueSegments) {
+                canvas.drawLine(
+                    segment.start.x,
+                    segment.start.y,
+                    segment.end.x,
+                    segment.end.y,
+                    if (segment.isRailBounce) cueBouncePaint else cueSolidPaint
+                )
             }
 
-            plan.impactPoint?.let { hit ->
-                canvas.drawCircle(hit.x, hit.y, plan.ballRadius, ghostBallPaint)
+            plan.impactPoint?.let {
+                canvas.drawCircle(
+                    it.x,
+                    it.y,
+                    plan.ballRadius,
+                    ghostBallPaint
+                )
             }
 
-            for (seg in plan.deflectedCueSegments) {
-                canvas.drawLine(seg.start.x, seg.start.y, seg.end.x, seg.end.y, cueBouncePaint)
+            for (segment in plan.deflectedCueSegments) {
+                canvas.drawLine(
+                    segment.start.x,
+                    segment.start.y,
+                    segment.end.x,
+                    segment.end.y,
+                    cueBouncePaint
+                )
             }
 
-            for (seg in plan.objectSegments) {
-                canvas.drawLine(seg.start.x, seg.start.y, seg.end.x, seg.end.y, objectAimPaint)
+            for (segment in plan.objectSegments) {
+                canvas.drawLine(
+                    segment.start.x,
+                    segment.start.y,
+                    segment.end.x,
+                    segment.end.y,
+                    objectAimPaint
+                )
             }
 
-            plan.objectSegments.lastOrNull()?.let { lastSeg ->
-                canvas.drawCircle(lastSeg.end.x, lastSeg.end.y, plan.ballRadius * 0.8f, pocketRingPaint)
+            plan.objectSegments.lastOrNull()?.let {
+                canvas.drawCircle(
+                    it.end.x,
+                    it.end.y,
+                    plan.ballRadius * 0.8f,
+                    pocketRingPaint
+                )
             }
 
             canvas.drawText(
-                "AUTO | PWR ${(plan.powerRatio * 100).toInt()}% | ANG ${plan.angleDeg.toInt()}° | BALLS ${plan.balls.size}",
-                plan.tableRect.left + 14f,
-                maxOf(36f, plan.tableRect.top - 16f),
+                "SPOTIFY POOL | BALLS ${plan.balls.size} | ${plan.angleDeg.toInt()}°",
+                plan.tableRect.left,
+                maxOf(28f, plan.tableRect.top - 12f),
                 hudPaint
             )
+
+            canvas.restoreToCount(save)
         }
     }
 }

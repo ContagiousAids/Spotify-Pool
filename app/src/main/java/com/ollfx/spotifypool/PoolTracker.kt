@@ -14,7 +14,6 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 object PoolTracker {
-
     data class Vec2(val x: Float, val y: Float)
 
     data class DetectedBall(
@@ -42,287 +41,246 @@ object PoolTracker {
         val impactPoint: Vec2?,
         val hitBall: DetectedBall?,
         val deflectedCueSegments: List<TrajectorySegment>,
-        val objectSegments: List<TrajectorySegment>
+        val objectSegments: List<TrajectorySegment>,
+        val frameWidth: Int,
+        val frameHeight: Int
     )
 
-    private const val BASE_MAX_REACH_PX = 1850f
-    private const val STEP_PX = 5f
+    private const val STEP = 4
+    private const val MAX_DISTANCE = 2200f
 
+    private var previousTable: RectF? = null
+    private var previousBalls: List<DetectedBall> = emptyList()
+
+    @Synchronized
     fun analyzeFrame(bitmap: Bitmap, step: Int): ShotPlan {
         val w = bitmap.width
         val h = bitmap.height
-        val safeStep = step.coerceAtLeast(2)
+        val sample = max(2, step)
 
-        val tableRect = detectTableBounds(bitmap, w, h, safeStep)
-        val pockets = computeSixPockets(tableRect)
-        val balls = detectBalls(bitmap, tableRect, safeStep)
+        val detectedTable = findTable(bitmap, sample)
+        val table = smoothTable(detectedTable)
+        val pockets = listOf(
+            Vec2(table.left, table.top),
+            Vec2(table.centerX(), table.top),
+            Vec2(table.right, table.top),
+            Vec2(table.left, table.bottom),
+            Vec2(table.centerX(), table.bottom),
+            Vec2(table.right, table.bottom)
+        )
 
-        val cueBall = balls.firstOrNull { it.isCueBall }
-            ?: balls.minByOrNull { hypot(it.center.x - tableRect.centerX(), it.center.y - tableRect.centerY()) }
+        val detectedBalls = findBalls(bitmap, table, sample)
+        val balls = smoothBalls(detectedBalls)
+        val cue = balls.firstOrNull { it.isCueBall }
 
-        val ballRadius = cueBall?.radius
-            ?: balls.map { it.radius }.average().toFloat().takeIf { !it.isNaN() && it > 4f }
-            ?: max(10f, tableRect.width() * 0.015f)
+        val radius = cue?.radius
+            ?: balls.map { it.radius }.average().toFloat()
+                .takeIf { it.isFinite() && it > 2f }
+            ?: table.width() * 0.014f
 
-        val powerRatio = detectPowerRatio(bitmap, tableRect, w, h)
-        val shotAngleRad = detectCueAngleRad(bitmap, tableRect, cueBall, balls)
-        val angleDeg = ((((shotAngleRad * 180.0 / PI) % 360.0) + 360.0) % 360.0).toFloat()
+        val angle = findCueAngle(bitmap, cue, balls, table)
+        val power = 0.65f
+        val cuePath = ArrayList<TrajectorySegment>()
+        val cueDeflection = ArrayList<TrajectorySegment>()
+        val objectPath = ArrayList<TrajectorySegment>()
+        var impact: Vec2? = null
+        var hit: DetectedBall? = null
 
-        val reachBudget = BASE_MAX_REACH_PX * (0.20f + 0.80f * powerRatio)
-        val cueSegments = ArrayList<TrajectorySegment>()
-        var impactPoint: Vec2? = null
-        var hitBall: DetectedBall? = null
+        if (cue != null) {
+            val dx = cos(angle).toFloat()
+            val dy = sin(angle).toFloat()
+            val result = trace(
+                cue.center, dx, dy, MAX_DISTANCE * power,
+                radius, table, balls.filter { it !== cue },
+                cuePath
+            )
+            impact = result.first
+            hit = result.second
 
-        if (cueBall != null) {
-            var pos = cueBall.center
-            var segStart = pos
-            var vx = cos(shotAngleRad).toFloat()
-            var vy = sin(shotAngleRad).toFloat()
-            var traveled = 0f
-            var segRail = false
+            if (impact != null && hit != null) {
+                val nx0 = hit.center.x - impact.x
+                val ny0 = hit.center.y - impact.y
+                val length = hypot(nx0, ny0).coerceAtLeast(0.001f)
+                val nx = nx0 / length
+                val ny = ny0 / length
+                val dot = (dx * nx + dy * ny).coerceIn(0f, 1f)
 
-            while (traveled < reachBudget) {
-                val candX = pos.x + vx * STEP_PX
-                val candY = pos.y + vy * STEP_PX
-                traveled += STEP_PX
+                val objectX = nx * dot
+                val objectY = ny * dot
+                val objectLength = hypot(objectX, objectY)
 
-                var hitRail = false
-                var nextX = candX
-                var nextY = candY
-
-                if (nextX - ballRadius < tableRect.left) {
-                    nextX = tableRect.left + ballRadius
-                    vx = -vx
-                    hitRail = true
-                } else if (nextX + ballRadius > tableRect.right) {
-                    nextX = tableRect.right - ballRadius
-                    vx = -vx
-                    hitRail = true
+                if (objectLength > 0.01f) {
+                    trace(
+                        hit.center,
+                        objectX / objectLength,
+                        objectY / objectLength,
+                        MAX_DISTANCE * 0.8f,
+                        radius,
+                        table,
+                        balls.filter { it !== hit && it !== cue },
+                        objectPath
+                    )
                 }
 
-                if (nextY - ballRadius < tableRect.top) {
-                    nextY = tableRect.top + ballRadius
-                    vy = -vy
-                    hitRail = true
-                } else if (nextY + ballRadius > tableRect.bottom) {
-                    nextY = tableRect.bottom - ballRadius
-                    vy = -vy
-                    hitRail = true
+                val cueX = dx - objectX
+                val cueY = dy - objectY
+                val cueLength = hypot(cueX, cueY)
+
+                if (cueLength > 0.04f) {
+                    trace(
+                        impact,
+                        cueX / cueLength,
+                        cueY / cueLength,
+                        MAX_DISTANCE * 0.45f,
+                        radius,
+                        table,
+                        balls.filter { it !== cue && it !== hit },
+                        cueDeflection
+                    )
                 }
-
-                val nextPos = Vec2(nextX, nextY)
-                if (hitRail) {
-                    if (hypot(nextPos.x - segStart.x, nextPos.y - segStart.y) >= 1f) {
-                        cueSegments.add(TrajectorySegment(segStart, nextPos, segRail))
-                    }
-                    segStart = nextPos
-                    segRail = true
-                }
-                pos = nextPos
-
-                val target = balls.firstOrNull { other ->
-                    other !== cueBall &&
-                        hypot(other.center.x - pos.x, other.center.y - pos.y) <= (ballRadius + other.radius) * 0.96f
-                }
-                if (target != null) {
-                    if (hypot(pos.x - segStart.x, pos.y - segStart.y) >= 1f) {
-                        cueSegments.add(TrajectorySegment(segStart, pos, segRail))
-                    }
-                    impactPoint = pos
-                    hitBall = target
-                    break
-                }
-            }
-
-            if (impactPoint == null && hypot(pos.x - segStart.x, pos.y - segStart.y) >= 1f) {
-                cueSegments.add(TrajectorySegment(segStart, pos, segRail))
-            }
-        }
-
-        val deflectedCueSegments = ArrayList<TrajectorySegment>()
-        val objectSegments = ArrayList<TrajectorySegment>()
-
-        if (cueBall != null && impactPoint != null && hitBall != null) {
-            val dx = hitBall.center.x - impactPoint.x
-            val dy = hitBall.center.y - impactPoint.y
-            val dist = hypot(dx, dy).coerceAtLeast(1e-4f)
-            val nx = dx / dist
-            val ny = dy / dist
-
-            val inX = cos(shotAngleRad).toFloat()
-            val inY = sin(shotAngleRad).toFloat()
-            val dot = (inX * nx + inY * ny).coerceIn(0f, 1f)
-
-            val objVx = nx * dot
-            val objVy = ny * dot
-            val cueOutX = inX - objVx
-            val cueOutY = inY - objVy
-
-            val objMag = hypot(objVx, objVy)
-            if (objMag > 1e-3f) {
-                val objBudget = reachBudget * (0.25f + 0.75f * objMag) * (0.4f + 0.6f * powerRatio)
-                traceRayWithRails(
-                    origin = hitBall.center,
-                    dirX = objVx / objMag,
-                    dirY = objVy / objMag,
-                    maxDistance = objBudget,
-                    ballRadius = ballRadius,
-                    tableRect = tableRect,
-                    pockets = pockets,
-                    outSegments = objectSegments
-                )
-            }
-
-            val cueOutMag = hypot(cueOutX, cueOutY)
-            if (cueOutMag > 1e-3f) {
-                val cueOutBudget = reachBudget * (0.20f + 0.80f * cueOutMag) * (0.35f + 0.65f * powerRatio)
-                traceRayWithRails(
-                    origin = impactPoint,
-                    dirX = cueOutX / cueOutMag,
-                    dirY = cueOutY / cueOutMag,
-                    maxDistance = cueOutBudget,
-                    ballRadius = ballRadius,
-                    tableRect = tableRect,
-                    pockets = pockets,
-                    outSegments = deflectedCueSegments
-                )
             }
         }
 
         return ShotPlan(
-            tableRect = tableRect,
+            tableRect = table,
             pockets = pockets,
-            ballRadius = ballRadius,
-            cueBall = cueBall,
+            ballRadius = radius,
+            cueBall = cue,
             balls = balls,
-            angleDeg = angleDeg,
-            powerRatio = powerRatio,
-            cueSegments = cueSegments,
-            impactPoint = impactPoint,
-            hitBall = hitBall,
-            deflectedCueSegments = deflectedCueSegments,
-            objectSegments = objectSegments
+            angleDeg = ((Math.toDegrees(angle) + 360.0) % 360.0).toFloat(),
+            powerRatio = power,
+            cueSegments = cuePath,
+            impactPoint = impact,
+            hitBall = hit,
+            deflectedCueSegments = cueDeflection,
+            objectSegments = objectPath,
+            frameWidth = w,
+            frameHeight = h
         )
     }
 
-    private fun traceRayWithRails(
-        origin: Vec2,
-        dirX: Float,
-        dirY: Float,
-        maxDistance: Float,
-        ballRadius: Float,
-        tableRect: RectF,
-        pockets: List<Vec2>,
-        outSegments: MutableList<TrajectorySegment>
-    ) {
-        var pos = origin
-        var segStart = origin
-        var vx = dirX
-        var vy = dirY
-        var traveled = 0f
-        var segRail = false
-        val pocketCaptureRadius = ballRadius * 1.45f
-
-        while (traveled < maxDistance) {
-            val candX = pos.x + vx * STEP_PX
-            val candY = pos.y + vy * STEP_PX
-            traveled += STEP_PX
-
-            var hitRail = false
-            var nextX = candX
-            var nextY = candY
-
-            if (nextX - ballRadius < tableRect.left) {
-                nextX = tableRect.left + ballRadius
-                vx = -vx
-                hitRail = true
-            } else if (nextX + ballRadius > tableRect.right) {
-                nextX = tableRect.right - ballRadius
-                vx = -vx
-                hitRail = true
-            }
-
-            if (nextY - ballRadius < tableRect.top) {
-                nextY = tableRect.top + ballRadius
-                vy = -vy
-                hitRail = true
-            } else if (nextY + ballRadius > tableRect.bottom) {
-                nextY = tableRect.bottom - ballRadius
-                vy = -vy
-                hitRail = true
-            }
-
-            val nextPos = Vec2(nextX, nextY)
-            if (hitRail) {
-                if (hypot(nextPos.x - segStart.x, nextPos.y - segStart.y) >= 1f) {
-                    outSegments.add(TrajectorySegment(segStart, nextPos, segRail))
-                }
-                segStart = nextPos
-                segRail = true
-            }
-            pos = nextPos
-
-            val inPocket = pockets.any { p -> hypot(p.x - pos.x, p.y - pos.y) <= pocketCaptureRadius }
-            if (inPocket) {
-                if (hypot(pos.x - segStart.x, pos.y - segStart.y) >= 1f) {
-                    outSegments.add(TrajectorySegment(segStart, pos, segRail))
-                }
-                return
-            }
-        }
-
-        if (hypot(pos.x - segStart.x, pos.y - segStart.y) >= 1f) {
-            outSegments.add(TrajectorySegment(segStart, pos, segRail))
-        }
-    }
-
-    private fun computeSixPockets(table: RectF): List<Vec2> {
-        val midX = (table.left + table.right) * 0.5f
-        return listOf(
-            Vec2(table.left, table.top),
-            Vec2(midX, table.top),
-            Vec2(table.right, table.top),
-            Vec2(table.left, table.bottom),
-            Vec2(midX, table.bottom),
-            Vec2(table.right, table.bottom)
-        )
-    }
-
-    private fun detectTableBounds(bitmap: Bitmap, w: Int, h: Int, step: Int): RectF {
-        var minX = w.toFloat()
-        var minY = h.toFloat()
-        var maxX = 0f
-        var maxY = 0f
-        var hits = 0
-
+    private fun findTable(bitmap: Bitmap, step: Int): RectF {
+        val w = bitmap.width
+        val h = bitmap.height
+        val cols = (w + step - 1) / step
+        val rows = (h + step - 1) / step
+        val mask = BooleanArray(cols * rows)
         val hsv = FloatArray(3)
-        var y = 0
-        while (y < h) {
-            var x = 0
-            while (x < w) {
-                Color.colorToHSV(bitmap.getPixel(x, y), hsv)
-                val isFeltGreen = hsv[0] in 72f..168f && hsv[1] >= 0.22f && hsv[2] >= 0.16f
-                if (isFeltGreen) {
-                    if (x < minX) minX = x.toFloat()
-                    if (y < minY) minY = y.toFloat()
-                    if (x > maxX) maxX = x.toFloat()
-                    if (y > maxY) maxY = y.toFloat()
-                    hits++
-                }
-                x += step
+
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                val color = bitmap.getPixel(
+                    min(w - 1, c * step),
+                    min(h - 1, r * step)
+                )
+                Color.colorToHSV(color, hsv)
+                mask[r * cols + c] =
+                    hsv[0] in 70f..175f &&
+                    hsv[1] > 0.20f &&
+                    hsv[2] > 0.12f
             }
-            y += step
         }
 
-        val spanW = maxX - minX
-        val spanH = maxY - minY
-        if (hits < 40 || spanW < w * 0.35f || spanH < h * 0.20f) {
-            return RectF(w * 0.14f, h * 0.23f, w * 0.86f, h * 0.77f)
+        val visited = BooleanArray(mask.size)
+        val queue = ArrayDeque<Int>()
+        var bestCount = 0
+        var bestLeft = 0
+        var bestTop = 0
+        var bestRight = 0
+        var bestBottom = 0
+
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+
+            queue.clear()
+            queue.add(start)
+            visited[start] = true
+
+            var count = 0
+            var left = cols
+            var top = rows
+            var right = 0
+            var bottom = 0
+
+            while (queue.isNotEmpty()) {
+                val index = queue.removeFirst()
+                val x = index % cols
+                val y = index / cols
+                count++
+
+                left = min(left, x)
+                right = max(right, x)
+                top = min(top, y)
+                bottom = max(bottom, y)
+
+                val neighbours = intArrayOf(
+                    index - 1, index + 1,
+                    index - cols, index + cols
+                )
+
+                for (next in neighbours) {
+                    if (next !in mask.indices || visited[next] || !mask[next]) continue
+                    if (next == index - 1 && x == 0) continue
+                    if (next == index + 1 && x == cols - 1) continue
+                    visited[next] = true
+                    queue.add(next)
+                }
+            }
+
+            val spanW = right - left
+            val spanH = bottom - top
+
+            if (spanW > cols * 0.35f &&
+                spanH > rows * 0.20f &&
+                count > bestCount
+            ) {
+                bestCount = count
+                bestLeft = left
+                bestTop = top
+                bestRight = right
+                bestBottom = bottom
+            }
         }
-        return RectF(minX, minY, maxX, maxY)
+
+        if (bestCount < 30) {
+            return RectF(w * 0.08f, h * 0.15f, w * 0.92f, h * 0.85f)
+        }
+
+        return RectF(
+            (bestLeft * step).toFloat(),
+            (bestTop * step).toFloat(),
+            min(w, (bestRight + 1) * step).toFloat(),
+            min(h, (bestBottom + 1) * step).toFloat()
+        )
     }
 
-    private fun detectBalls(bitmap: Bitmap, table: RectF, step: Int): List<DetectedBall> {
+    private fun smoothTable(found: RectF): RectF {
+        val old = previousTable
+        val result = if (old == null ||
+            absRatio(old.width(), found.width()) > 0.25f ||
+            absRatio(old.height(), found.height()) > 0.25f
+        ) {
+            RectF(found)
+        } else {
+            RectF(
+                old.left * 0.65f + found.left * 0.35f,
+                old.top * 0.65f + found.top * 0.35f,
+                old.right * 0.65f + found.right * 0.35f,
+                old.bottom * 0.65f + found.bottom * 0.35f
+            )
+        }
+        previousTable = result
+        return RectF(result)
+    }
+
+    private fun absRatio(a: Float, b: Float): Float =
+        kotlin.math.abs(a - b) / max(1f, a)
+
+    private fun findBalls(
+        bitmap: Bitmap,
+        table: RectF,
+        step: Int
+    ): List<DetectedBall> {
         val left = max(0, table.left.toInt())
         val top = max(0, table.top.toInt())
         val right = min(bitmap.width, table.right.toInt())
@@ -334,164 +292,249 @@ object PoolTracker {
         val cueMask = BooleanArray(cols * rows)
         val hsv = FloatArray(3)
 
-        for (r in 0 until rows) {
-            val py = top + r * step
-            for (c in 0 until cols) {
-                val px = left + c * step
-                val color = bitmap.getPixel(px, py)
+        for (y in 0 until rows) {
+            for (x in 0 until cols) {
+                val color = bitmap.getPixel(left + x * step, top + y * step)
                 Color.colorToHSV(color, hsv)
-                val felt = hsv[0] in 72f..168f && hsv[1] >= 0.22f && hsv[2] >= 0.16f
-                if (!felt && hsv[2] > 0.14f) {
-                    val idx = r * cols + c
-                    mask[idx] = true
-                    if (hsv[1] < 0.20f && hsv[2] > 0.80f) {
-                        cueMask[idx] = true
+
+                val felt = hsv[0] in 70f..175f &&
+                    hsv[1] > 0.20f && hsv[2] > 0.12f
+
+                val isBallPixel = !felt && hsv[2] > 0.22f &&
+                    hsv[1] < 0.96f
+
+                val index = y * cols + x
+                mask[index] = isBallPixel
+                cueMask[index] = hsv[1] < 0.20f && hsv[2] > 0.76f
+            }
+        }
+
+        val visited = BooleanArray(mask.size)
+        val queue = ArrayDeque<Int>()
+        val found = ArrayList<DetectedBall>()
+        val expectedRadius = table.width() * 0.014f
+        val minRadius = max(4f, expectedRadius * 0.48f)
+        val maxRadius = expectedRadius * 2.2f
+
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+
+            queue.clear()
+            queue.add(start)
+            visited[start] = true
+
+            var count = 0
+            var sumX = 0f
+            var sumY = 0f
+            var whiteCount = 0
+            var minX = cols
+            var maxX = 0
+            var minY = rows
+            var maxY = 0
+
+            while (queue.isNotEmpty()) {
+                val index = queue.removeFirst()
+                val x = index % cols
+                val y = index / cols
+                count++
+
+                sumX += (left + x * step).toFloat()
+                sumY += (top + y * step).toFloat()
+                minX = min(minX, x)
+                maxX = max(maxX, x)
+                minY = min(minY, y)
+                maxY = max(maxY, y)
+
+                if (cueMask[index]) whiteCount++
+
+                for (dy in -1..1) {
+                    for (dx in -1..1) {
+                        if (dx == 0 && dy == 0) continue
+                        val nx = x + dx
+                        val ny = y + dy
+                        if (nx !in 0 until cols || ny !in 0 until rows) continue
+                        val next = ny * cols + nx
+                        if (!mask[next] || visited[next]) continue
+                        visited[next] = true
+                        queue.add(next)
                     }
                 }
             }
+
+            if (count < 3 || count > 450) continue
+
+            val boxW = (maxX - minX + 1) * step
+            val boxH = (maxY - minY + 1) * step
+            val aspect = boxW.toFloat() / max(1, boxH)
+            if (aspect !in 0.55f..1.8f) continue
+
+            val area = count * step * step
+            val radius = sqrt(area / PI).toFloat()
+            if (radius !in minRadius..maxRadius) continue
+
+            found.add(
+                DetectedBall(
+                    center = Vec2(sumX / count, sumY / count),
+                    radius = radius,
+                    areaPx = area,
+                    isCueBall = whiteCount > count * 0.48f
+                )
+            )
         }
 
-        val visited = BooleanArray(cols * rows)
-        val result = ArrayList<DetectedBall>()
-        val queue = ArrayDeque<Int>()
-        val dirs = intArrayOf(-1, 1, -cols, cols)
+        return found
+    }
 
-        for (idx in mask.indices) {
-            if (!mask[idx] || visited[idx]) continue
-            visited[idx] = true
-            queue.clear()
-            queue.add(idx)
-
-            var sumX = 0f
-            var sumY = 0f
-            var count = 0
-            var cueHits = 0
-
-            while (queue.isNotEmpty()) {
-                val cur = queue.removeFirst()
-                val r = cur / cols
-                val c = cur % cols
-                sumX += (left + c * step).toFloat()
-                sumY += (top + r * step).toFloat()
-                count++
-                if (cueMask[cur]) cueHits++
-
-                for (d in dirs) {
-                    val nxt = cur + d
-                    if (nxt < 0 || nxt >= mask.size || visited[nxt] || !mask[nxt]) continue
-                    if (d == -1 && (cur % cols) == 0) continue
-                    if (d == 1 && ((cur + 1) % cols) == 0) continue
-                    visited[nxt] = true
-                    queue.add(nxt)
-                }
+    private fun smoothBalls(found: List<DetectedBall>): List<DetectedBall> {
+        val old = previousBalls
+        val result = found.map { ball ->
+            val previous = old.minByOrNull {
+                hypot(it.center.x - ball.center.x, it.center.y - ball.center.y)
             }
-
-            if (count in 2..600) {
-                val area = count * step * step
-                val radiusPx = sqrt(area / PI).toFloat()
-                if (radiusPx in 4f..65f) {
-                    result.add(
-                        DetectedBall(
-                            center = Vec2(sumX / count, sumY / count),
-                            radius = radiusPx,
-                            areaPx = area,
-                            isCueBall = cueHits > count * 0.40f
-                        )
+            if (previous != null &&
+                hypot(previous.center.x - ball.center.x, previous.center.y - ball.center.y)
+                    < ball.radius * 2.5f
+            ) {
+                ball.copy(
+                    center = Vec2(
+                        previous.center.x * 0.30f + ball.center.x * 0.70f,
+                        previous.center.y * 0.30f + ball.center.y * 0.70f
                     )
-                }
+                )
+            } else {
+                ball
             }
         }
+        previousBalls = result
         return result
     }
 
-    private fun detectPowerRatio(bitmap: Bitmap, table: RectF, w: Int, h: Int): Float {
-        val barLeft = max(0, table.left.toInt())
-        val barRight = min(w, table.right.toInt())
-        val yStart = min(h - 1, (table.bottom + h * 0.03f).toInt())
-        val yEnd = min(h, (table.bottom + h * 0.16f).toInt())
-        if (yEnd <= yStart || barRight <= barLeft) return 0.55f
-
-        var activeCols = 0
-        var totalCols = 0
-        val hsv = FloatArray(3)
-        var x = barLeft
-        while (x < barRight) {
-            totalCols++
-            var litInCol = 0
-            var y = yStart
-            while (y < yEnd) {
-                Color.colorToHSV(bitmap.getPixel(x, y), hsv)
-                if (hsv[1] > 0.42f && hsv[2] > 0.50f) {
-                    litInCol++
-                }
-                y += 3
-            }
-            if (litInCol >= 2) activeCols++
-            x += 5
-        }
-        return if (totalCols > 0) (activeCols.toFloat() / totalCols.toFloat()).coerceIn(0.08f, 1.0f) else 0.55f
-    }
-
-    private fun detectCueAngleRad(
+    private fun findCueAngle(
         bitmap: Bitmap,
-        table: RectF,
-        cueBall: DetectedBall?,
-        balls: List<DetectedBall>
+        cue: DetectedBall?,
+        balls: List<DetectedBall>,
+        table: RectF
     ): Double {
-        if (cueBall != null) {
-            val minDist = cueBall.radius * 1.15f
-            val maxDist = max(65f, cueBall.radius * 6.5f)
-            val x0 = max(0, (cueBall.center.x - maxDist).toInt())
-            val y0 = max(0, (cueBall.center.y - maxDist).toInt())
-            val x1 = min(bitmap.width, (cueBall.center.x + maxDist).toInt())
-            val y1 = min(bitmap.height, (cueBall.center.y + maxDist).toInt())
+        if (cue == null) return 0.0
 
-            var sumX = 0.0
-            var sumY = 0.0
-            var weightSum = 0.0
-            val hsv = FloatArray(3)
+        val range = cue.radius * 7f
+        val hsv = FloatArray(3)
+        var sx = 0.0
+        var sy = 0.0
+        var weights = 0.0
 
-            var y = y0
-            while (y < y1) {
-                var x = x0
-                while (x < x1) {
-                    val dx = x - cueBall.center.x
-                    val dy = y - cueBall.center.y
-                    val d = hypot(dx, dy)
-                    if (d in minDist..maxDist) {
-                        Color.colorToHSV(bitmap.getPixel(x, y), hsv)
-                        val warmStick = (hsv[0] in 12f..58f || hsv[0] in 325f..360f) &&
-                            hsv[1] >= 0.30f && hsv[2] >= 0.30f
-                        if (warmStick) {
-                            val w = d.toDouble()
-                            sumX += dx * w
-                            sumY += dy * w
-                            weightSum += w
-                        }
+        val x0 = max(0, (cue.center.x - range).toInt())
+        val x1 = min(bitmap.width, (cue.center.x + range).toInt())
+        val y0 = max(0, (cue.center.y - range).toInt())
+        val y1 = min(bitmap.height, (cue.center.y + range).toInt())
+
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val dx = x - cue.center.x
+                val dy = y - cue.center.y
+                val distance = hypot(dx, dy)
+
+                if (distance > cue.radius * 1.5f && distance < range) {
+                    Color.colorToHSV(bitmap.getPixel(x, y), hsv)
+                    val warm = (hsv[0] in 12f..58f || hsv[0] in 325f..360f) &&
+                        hsv[1] > 0.30f && hsv[2] > 0.30f
+
+                    if (warm) {
+                        sx += dx * distance
+                        sy += dy * distance
+                        weights += distance
                     }
-                    x += 2
                 }
-                y += 2
+                x += 3
             }
-
-            if (weightSum > 0.0) {
-                val shaftAngle = atan2(sumY / weightSum, sumX / weightSum)
-                return shaftAngle + PI
-            }
+            y += 3
         }
 
-        val nearest = balls.filter { it !== cueBall }.minByOrNull {
-            val cx = cueBall?.center?.x ?: table.centerX()
-            val cy = cueBall?.center?.y ?: table.centerY()
-            hypot(it.center.x - cx, it.center.y - cy)
+        if (weights > 0.0) return atan2(sy, sx) + PI
+
+        val target = balls.filter { it !== cue }.minByOrNull {
+            hypot(it.center.x - cue.center.x, it.center.y - cue.center.y)
         }
-        return if (cueBall != null && nearest != null) {
+
+        return if (target != null) {
             atan2(
-                (nearest.center.y - cueBall.center.y).toDouble(),
-                (nearest.center.x - cueBall.center.x).toDouble()
+                (target.center.y - cue.center.y).toDouble(),
+                (target.center.x - cue.center.x).toDouble()
             )
         } else {
             0.0
         }
+    }
+
+    private fun trace(
+        origin: Vec2,
+        directionX: Float,
+        directionY: Float,
+        maxDistance: Float,
+        radius: Float,
+        table: RectF,
+        obstacles: List<DetectedBall>,
+        output: MutableList<TrajectorySegment>
+    ): Pair<Vec2?, DetectedBall?> {
+        var x = origin.x
+        var y = origin.y
+        var dx = directionX
+        var dy = directionY
+        var start = origin
+        var bounced = false
+        var travelled = 0f
+        val step = max(2f, radius * 0.20f)
+
+        while (travelled < maxDistance) {
+            var nx = x + dx * step
+            var ny = y + dy * step
+            travelled += step
+            var rail = false
+
+            if (nx - radius < table.left) {
+                nx = table.left + radius
+                dx = -dx
+                rail = true
+            } else if (nx + radius > table.right) {
+                nx = table.right - radius
+                dx = -dx
+                rail = true
+            }
+
+            if (ny - radius < table.top) {
+                ny = table.top + radius
+                dy = -dy
+                rail = true
+            } else if (ny + radius > table.bottom) {
+                ny = table.bottom - radius
+                dy = -dy
+                rail = true
+            }
+
+            x = nx
+            y = ny
+
+            if (rail) {
+                output.add(TrajectorySegment(start, Vec2(x, y), bounced))
+                start = Vec2(x, y)
+                bounced = true
+            }
+
+            val collision = obstacles.firstOrNull {
+                hypot(it.center.x - x, it.center.y - y) < radius + it.radius
+            }
+
+            if (collision != null) {
+                output.add(TrajectorySegment(start, Vec2(x, y), bounced))
+                return Pair(Vec2(x, y), collision)
+            }
+        }
+
+        if (hypot(x - start.x, y - start.y) > 1f) {
+            output.add(TrajectorySegment(start, Vec2(x, y), bounced))
+        }
+        return Pair(null, null)
     }
 }
