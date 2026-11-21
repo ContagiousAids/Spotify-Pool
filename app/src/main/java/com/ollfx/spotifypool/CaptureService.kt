@@ -1,125 +1,259 @@
 package com.ollfx.spotifypool
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.PorterDuff
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.DisplayMetrics
+import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 
 class CaptureService : Service() {
-    private var projection: MediaProjection? = null
-    private var display: VirtualDisplay? = null
-    private var reader: ImageReader? = null
-    private var thread: HandlerThread? = null
-    private var frameCount = 0L
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) { stopCapture(); stopSelf(); return START_NOT_STICKY }
-        if (intent?.action == ACTION_START) {
-            createNotificationChannel()
-            if (Build.VERSION.SDK_INT >= 29) {
-                startForeground(41, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-            } else {
-                startForeground(41, notification())
-            }
-            val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-            val data = intent.getParcelableExtra<Intent>(EXTRA_DATA) ?: run { stopSelf(); return START_NOT_STICKY }
-            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection = manager.getMediaProjection(resultCode, data)
-            startCapture()
-        }
-        return START_NOT_STICKY
+    companion object {
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_DATA_INTENT = "data_intent"
+        private const val CHANNEL_ID = "spotify_pool_overlay"
+        private const val NOTIFICATION_ID = 1042
+        private const val SAMPLE_STEP_PX = 4
     }
 
-    private fun startCapture() {
+    private lateinit var windowManager: WindowManager
+    private lateinit var projectionManager: MediaProjectionManager
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var overlayView: TrajectoryOverlayView? = null
+
+    private val workerThread = HandlerThread("PoolVisionThread").apply { start() }
+    private lateinit var workerHandler: Handler
+
+    @Volatile
+    private var latestPlan: PoolTracker.ShotPlan? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        projectionManager = getSystemService(MediaProjectionManager::class.java)
+        workerHandler = Handler(workerThread.looper)
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification())
+        attachOverlay()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+        val dataIntent = intent?.getParcelableExtra<Intent>(EXTRA_DATA_INTENT)
+
+        if (resultCode == Activity.RESULT_OK && dataIntent != null && mediaProjection == null) {
+            setupProjection(resultCode, dataIntent)
+        }
+        return START_STICKY
+    }
+
+    private fun setupProjection(resultCode: Int, dataIntent: Intent) {
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
-        (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(metrics)
+        windowManager.defaultDisplay.getRealMetrics(metrics)
         val width = metrics.widthPixels
         val height = metrics.heightPixels
         val density = metrics.densityDpi
-        thread = HandlerThread("pool-frame-reader").also { it.start() }
-        val handler = Handler(thread!!.looper)
-        reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        reader?.setOnImageAvailableListener({ source ->
-            var image: Image? = null
-            try {
-                image = source.acquireLatestImage()
-                if (image != null) {
-                    frameCount++
-                    val plane = image.planes[0]
-                    val buffer = plane.buffer
-                    // Frame data is received here. Keep processing lightweight on this worker thread.
-                    // Next stage adds table/ball detection and the aiming overlay.
-                    if (frameCount % 120L == 0L) {
-                        android.util.Log.d("SpotifyPool", "Captured $frameCount frames (${image.width}x${image.height}, ${buffer.remaining()} bytes)")
-                    }
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("SpotifyPool", "Frame read failed", e)
-            } finally { image?.close() }
-        }, handler)
-        // Android 14+ requires the callback to be registered before creating the virtual display.
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopCapture(); stopSelf() }
-        }, handler)
-        display = projection?.createVirtualDisplay(
-            "SpotifyPoolCapture", width, height, density,
+
+        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        imageReader = reader
+
+        val projection = projectionManager.getMediaProjection(resultCode, dataIntent)
+        mediaProjection = projection
+
+        val display = projection.createVirtualDisplay(
+            "SpotifyPoolCapture",
+            width,
+            height,
+            density,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader?.surface, null, handler
+            reader.surface,
+            null,
+            workerHandler
         )
+        virtualDisplay = display
+
+        reader.setOnImageAvailableListener({ ir ->
+            val image = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val plane = image.planes[0]
+                val rowStride = plane.rowStride
+                val pixelStride = plane.pixelStride
+                val buffer = plane.buffer
+                buffer.rewind()
+
+                val rawWidth = rowStride / pixelStride
+                val bmp = Bitmap.createBitmap(rawWidth, image.height, Bitmap.Config.ARGB_8888)
+                bmp.copyPixelsFromBuffer(buffer)
+
+                val cropped = if (rawWidth != width) {
+                    Bitmap.createBitmap(bmp, 0, 0, width, image.height).also {
+                        if (it != bmp) bmp.recycle()
+                    }
+                } else {
+                    bmp
+                }
+
+                val plan = PoolTracker.analyzeFrame(cropped, SAMPLE_STEP_PX)
+                if (!cropped.isRecycled) cropped.recycle()
+
+                latestPlan = plan
+                overlayView?.postInvalidate()
+            } finally {
+                image.close()
+            }
+        }, workerHandler)
     }
 
-    private fun notification(): Notification {
-        return if (Build.VERSION.SDK_INT >= 26) {
-            Notification.Builder(this, CHANNEL).setContentTitle("Spotify Pool")
-                .setContentText("Screen capture is active").setSmallIcon(android.R.drawable.ic_menu_view)
-                .setOngoing(true).build()
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this).setContentTitle("Spotify Pool")
-                .setContentText("Screen capture is active").setSmallIcon(android.R.drawable.ic_menu_view)
-                .build()
+    private fun attachOverlay() {
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
         }
+
+        val view = TrajectoryOverlayView(this)
+        overlayView = view
+        windowManager.addView(view, params)
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel(CHANNEL, "Screen capture", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+        val manager = getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Pool Trajectory Overlay",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        manager.createNotificationChannel(channel)
+    }
+
+    private fun buildNotification(): Notification {
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Overlay Active")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .build()
+    }
+
+    override fun onDestroy() {
+        virtualDisplay?.release()
+        mediaProjection?.stop()
+        imageReader?.close()
+        overlayView?.let {
+            runCatching { windowManager.removeView(it) }
         }
+        workerThread.quitSafely()
+        super.onDestroy()
     }
 
-    private fun stopCapture() {
-        display?.release(); display = null
-        reader?.close(); reader = null
-        projection?.stop(); projection = null
-        thread?.quitSafely(); thread = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
-    }
-
-    override fun onDestroy() { stopCapture(); super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
 
-    companion object {
-        const val ACTION_START = "com.ollfx.spotifypool.START_CAPTURE"
-        const val ACTION_STOP = "com.ollfx.spotifypool.STOP_CAPTURE"
-        const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_DATA = "capture_data"
-        private const val CHANNEL = "spotify_pool_capture"
+    private inner class TrajectoryOverlayView(context: Context) : View(context) {
+        private val cueSolidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            strokeWidth = 6f
+            style = Paint.Style.STROKE
+        }
+        private val cueBouncePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.CYAN
+            strokeWidth = 5f
+            style = Paint.Style.STROKE
+            pathEffect = DashPathEffect(floatArrayOf(18f, 10f), 0f)
+        }
+        private val objectAimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.YELLOW
+            strokeWidth = 6f
+            style = Paint.Style.STROKE
+        }
+        private val pocketRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.GREEN
+            strokeWidth = 3.5f
+            style = Paint.Style.STROKE
+        }
+        private val ballMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(180, 0, 255, 180)
+            strokeWidth = 2.5f
+            style = Paint.Style.STROKE
+        }
+        private val ghostBallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            strokeWidth = 4f
+            style = Paint.Style.STROKE
+        }
+        private val hudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 32f
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            val plan = latestPlan ?: return
+
+            for (ball in plan.balls) {
+                canvas.drawCircle(ball.center.x, ball.center.y, ball.radius + 3f, ballMarkerPaint)
+            }
+
+            for (pocket in plan.pockets) {
+                canvas.drawCircle(pocket.x, pocket.y, plan.ballRadius * 1.4f, pocketRingPaint)
+            }
+
+            for (seg in plan.cueSegments) {
+                val paint = if (seg.isRailBounce) cueBouncePaint else cueSolidPaint
+                canvas.drawLine(seg.start.x, seg.start.y, seg.end.x, seg.end.y, paint)
+            }
+
+            plan.impactPoint?.let { hit ->
+                canvas.drawCircle(hit.x, hit.y, plan.ballRadius, ghostBallPaint)
+            }
+
+            for (seg in plan.deflectedCueSegments) {
+                canvas.drawLine(seg.start.x, seg.start.y, seg.end.x, seg.end.y, cueBouncePaint)
+            }
+
+            for (seg in plan.objectSegments) {
+                canvas.drawLine(seg.start.x, seg.start.y, seg.end.x, seg.end.y, objectAimPaint)
+            }
+
+            plan.objectSegments.lastOrNull()?.let { lastSeg ->
+                canvas.drawCircle(lastSeg.end.x, lastSeg.end.y, plan.ballRadius * 0.8f, pocketRingPaint)
+            }
+
+            canvas.drawText(
+                "AUTO | PWR ${(plan.powerRatio * 100).toInt()}% | ANG ${plan.angleDeg.toInt()}° | BALLS ${plan.balls.size}",
+                plan.tableRect.left + 14f,
+                maxOf(36f, plan.tableRect.top - 16f),
+                hudPaint
+            )
+        }
     }
 }
