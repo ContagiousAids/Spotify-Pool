@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.RectF
 import java.util.ArrayDeque
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
