@@ -1,42 +1,22 @@
-# Spotify Pool (working title)
+# Spotify Pool — Android 0.2.0
 
-Free Android development scaffold for an independent 8-ball-pool aiming assistant.
+This is the next development build for the existing `com.ollfx.spotifypool` application.
 
-## Package identity
-Android package names cannot contain hyphens. The requested display name is **Spotify Pool** and the valid application ID is `com.ollfx.spotifypool`.
+## Included in 0.2.0
+- Android MediaProjection consent flow.
+- Foreground screen-capture service and notification.
+- ImageReader frame acquisition with safe frame closing.
+- Start/stop capture controls.
+- GitHub Actions debug APK workflow.
 
-## Build on GitHub using a phone
-1. Create a new repository named `Spotify-Pool`.
-2. Upload the contents of this folder to the repository root (not the containing folder).
-3. Commit the files to the `main` branch.
-4. Open the repository's **Actions** tab.
-5. Select **Android APK** and press **Run workflow**, or let the push-triggered build run.
-6. Open the successful workflow run, scroll to **Artifacts**, and download `spotify-pool-debug-apk`.
-7. Extract the ZIP on Android and install `app-debug.apk`. Android may ask you to allow installs from your browser or file manager.
+## Not yet implemented
+- Automatic table boundary detection.
+- Ball recognition/tracking.
+- Trajectory, collision, cushion/bank-shot solver.
+- Floating aiming overlay and calibration.
+- Device/gameplay validation.
 
-## Build environment
-- JDK 17
-- Gradle 8.9
-- Android Gradle Plugin 8.7.3
-- compileSdk 35
-- minSdk 29 (Android 10+)
+This build is an implementation step, not a finished aiming assistant. Android requires the user to approve screen capture each session. The capture notification remains visible while capture is active.
 
-## Current implementation status
-This is a compiling foundation scaffold, not a finished aiming tool. It currently provides:
-- Native Android activity and diagnostic screen
-- Overlay-permission status check and settings shortcut
-- GitHub Actions debug APK workflow
-
-Not yet implemented:
-- MediaProjection screen capture
-- Table and ball detection
-- Cue/target-ball classification
-- Collision and cushion trajectory solver
-- Floating aiming overlay
-
-Do not treat the current APK as detecting balls or calculating shots. Implement and validate those modules in later milestones using screenshots from the intended device/game version.
-
-## Debugging
-- Build errors: open the failed GitHub Actions run and expand **Build debug APK**.
-- Runtime crashes: capture Android Logcat output with an ADB-capable Android debugging setup, then share the exception and stack trace.
-- Include device model, Android version, commit hash, and exact reproduction steps with bug reports.
+## Build
+Push to `main` or manually run the Android APK workflow in GitHub Actions. Download the `Spotify-Pool-APK` artifact and install the APK on an Android 10+ device.
