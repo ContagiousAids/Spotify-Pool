@@ -242,15 +242,15 @@ object PoolTracker {
         val mask = BooleanArray(cols * rows)
         val hsv = FloatArray(3)
 
+        // Support both green and blue pool-table felt.
         for (r in 0 until rows) {
             for (c in 0 until cols) {
-                val color = bitmap.getPixel(
-                    min(w - 1, c * step),
-                    min(h - 1, r * step)
+                Color.colorToHSV(
+                    bitmap.getPixel(min(w - 1, c * step), min(h - 1, r * step)),
+                    hsv
                 )
-                Color.colorToHSV(color, hsv)
                 mask[r * cols + c] =
-                    hsv[0] in 70f..175f &&
+                    hsv[0] in 65f..280f &&
                     hsv[1] > 0.20f &&
                     hsv[2] > 0.12f
             }
@@ -264,12 +264,12 @@ object PoolTracker {
         var bestRight = 0
         var bestBottom = 0
 
-        for (start in mask.indices) {
-            if (!mask[start] || visited[start]) continue
+        for (startIndex in mask.indices) {
+            if (!mask[startIndex] || visited[startIndex]) continue
 
             queue.clear()
-            queue.add(start)
-            visited[start] = true
+            queue.add(startIndex)
+            visited[startIndex] = true
 
             var count = 0
             var left = cols
@@ -305,8 +305,8 @@ object PoolTracker {
             val spanW = right - left
             val spanH = bottom - top
 
-            if (spanW > cols * 0.35f &&
-                spanH > rows * 0.20f &&
+            if (spanW > cols * 0.30f &&
+                spanH > rows * 0.18f &&
                 count > bestCount
             ) {
                 bestCount = count
@@ -361,42 +361,104 @@ object PoolTracker {
         val right = min(bitmap.width, table.right.toInt())
         val bottom = min(bitmap.height, table.bottom.toInt())
 
-        val cols = max(1, (right - left) / step)
-        val rows = max(1, (bottom - top) / step)
+        val cols = max(1, (right - left + step - 1) / step)
+        val rows = max(1, (bottom - top + step - 1) / step)
+
+        val hsv = FloatArray(3)
+        val hueHistogram = IntArray(360)
+
+        // Learn the dominant felt hue from the table itself.
+        for (y in 0 until rows step 2) {
+            for (x in 0 until cols step 2) {
+                Color.colorToHSV(
+                    bitmap.getPixel(
+                        min(bitmap.width - 1, left + x * step),
+                        min(bitmap.height - 1, top + y * step)
+                    ),
+                    hsv
+                )
+                if (hsv[1] > 0.25f && hsv[2] > 0.15f) {
+                    hueHistogram[hsv[0].toInt().coerceIn(0, 359)]++
+                }
+            }
+        }
+
+        val feltHue = hueHistogram.indices.maxByOrNull {
+            hueHistogram[it]
+        }?.toFloat() ?: 120f
+
+        var saturationTotal = 0f
+        var valueTotal = 0f
+        var feltSamples = 0
+
+        for (y in 0 until rows step 2) {
+            for (x in 0 until cols step 2) {
+                Color.colorToHSV(
+                    bitmap.getPixel(
+                        min(bitmap.width - 1, left + x * step),
+                        min(bitmap.height - 1, top + y * step)
+                    ),
+                    hsv
+                )
+                val difference = min(
+                    abs(hsv[0] - feltHue),
+                    360f - abs(hsv[0] - feltHue)
+                )
+                if (difference < 18f && hsv[1] > 0.20f) {
+                    saturationTotal += hsv[1]
+                    valueTotal += hsv[2]
+                    feltSamples++
+                }
+            }
+        }
+
+        val feltSat = if (feltSamples > 0) saturationTotal / feltSamples else 0.5f
+        val feltValue = if (feltSamples > 0) valueTotal / feltSamples else 0.5f
+
         val mask = BooleanArray(cols * rows)
         val cueMask = BooleanArray(cols * rows)
-        val hsv = FloatArray(3)
 
         for (y in 0 until rows) {
             for (x in 0 until cols) {
-                val color = bitmap.getPixel(left + x * step, top + y * step)
-                Color.colorToHSV(color, hsv)
+                Color.colorToHSV(
+                    bitmap.getPixel(
+                        min(bitmap.width - 1, left + x * step),
+                        min(bitmap.height - 1, top + y * step)
+                    ),
+                    hsv
+                )
 
-                val felt = hsv[0] in 70f..175f &&
-                    hsv[1] > 0.20f && hsv[2] > 0.12f
+                val hueDifference = min(
+                    abs(hsv[0] - feltHue),
+                    360f - abs(hsv[0] - feltHue)
+                )
 
-                val isBallPixel = !felt && hsv[2] > 0.22f &&
-                    hsv[1] < 0.96f
+                // A pixel is felt only when its hue, saturation and brightness
+                // are sufficiently close to the learned table colour.
+                val isFelt = hueDifference < 18f &&
+                    abs(hsv[1] - feltSat) < 0.28f &&
+                    abs(hsv[2] - feltValue) < 0.32f
 
                 val index = y * cols + x
-                mask[index] = isBallPixel
-                cueMask[index] = hsv[1] < 0.20f && hsv[2] > 0.76f
+                mask[index] = !isFelt && hsv[2] > 0.08f
+                cueMask[index] = hsv[1] < 0.23f && hsv[2] > 0.68f
             }
         }
 
         val visited = BooleanArray(mask.size)
         val queue = ArrayDeque<Int>()
         val found = ArrayList<DetectedBall>()
-        val expectedRadius = table.width() * 0.014f
-        val minRadius = max(4f, expectedRadius * 0.48f)
-        val maxRadius = expectedRadius * 2.2f
 
-        for (start in mask.indices) {
-            if (!mask[start] || visited[start]) continue
+        val expectedRadius = table.width() * 0.014f
+        val minRadius = max(3f, expectedRadius * 0.35f)
+        val maxRadius = expectedRadius * 2.5f
+
+        for (startIndex in mask.indices) {
+            if (!mask[startIndex] || visited[startIndex]) continue
 
             queue.clear()
-            queue.add(start)
-            visited[start] = true
+            queue.add(startIndex)
+            visited[startIndex] = true
 
             var count = 0
             var sumX = 0f
@@ -411,8 +473,8 @@ object PoolTracker {
                 val index = queue.removeFirst()
                 val x = index % cols
                 val y = index / cols
-                count++
 
+                count++
                 sumX += (left + x * step).toFloat()
                 sumY += (top + y * step).toFloat()
                 minX = min(minX, x)
@@ -428,20 +490,23 @@ object PoolTracker {
                         val nx = x + dx
                         val ny = y + dy
                         if (nx !in 0 until cols || ny !in 0 until rows) continue
+
                         val next = ny * cols + nx
                         if (!mask[next] || visited[next]) continue
+
                         visited[next] = true
                         queue.add(next)
                     }
                 }
             }
 
-            if (count < 3 || count > 450) continue
+            if (count < 3 || count > 700) continue
 
             val boxW = (maxX - minX + 1) * step
             val boxH = (maxY - minY + 1) * step
             val aspect = boxW.toFloat() / max(1, boxH)
-            if (aspect !in 0.55f..1.8f) continue
+
+            if (aspect !in 0.45f..2.2f) continue
 
             val area = count * step * step
             val radius = sqrt(area / PI).toFloat()
@@ -452,7 +517,7 @@ object PoolTracker {
                     center = Vec2(sumX / count, sumY / count),
                     radius = radius,
                     areaPx = area,
-                    isCueBall = whiteCount > count * 0.48f
+                    isCueBall = whiteCount > count * 0.35f
                 )
             )
         }
