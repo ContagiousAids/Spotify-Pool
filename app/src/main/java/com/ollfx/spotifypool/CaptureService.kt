@@ -362,9 +362,16 @@ class CaptureService : Service() {
 
             val save = canvas.save()
 
-            val scaleX = width.toFloat() / plan.frameWidth.toFloat()
-            val scaleY = height.toFloat() / plan.frameHeight.toFloat()
-            canvas.scale(scaleX, scaleY)
+            // Preserve the captured frame's aspect ratio.
+            // Independent X/Y scaling was distorting overlay coordinates.
+            val scale = minOf(
+                width.toFloat() / plan.frameWidth.toFloat(),
+                height.toFloat() / plan.frameHeight.toFloat()
+            )
+            val offsetX = (width - plan.frameWidth * scale) / 2f
+            val offsetY = (height - plan.frameHeight * scale) / 2f
+            canvas.translate(offsetX, offsetY)
+            canvas.scale(scale, scale)
 
             for (ball in plan.balls) {
                 canvas.drawCircle(
@@ -433,7 +440,7 @@ class CaptureService : Service() {
             }
 
             canvas.drawText(
-                "SPOTIFY POOL | BALLS ${plan.balls.size} | ${plan.angleDeg.toInt()}°",
+                "POOL | BALLS ${plan.balls.size} | CUE ${if (plan.cueBall != null) "FOUND" else "NOT FOUND"} | ${plan.angleDeg.toInt()}°",
                 plan.tableRect.left,
                 maxOf(28f, plan.tableRect.top - 12f),
                 hudPaint

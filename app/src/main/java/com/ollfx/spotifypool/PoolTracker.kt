@@ -60,14 +60,6 @@ object PoolTracker {
 
         val detectedTable = findTable(bitmap, sample)
         val table = smoothTable(detectedTable)
-        val pockets = listOf(
-            Vec2(table.left, table.top),
-            Vec2(table.centerX(), table.top),
-            Vec2(table.right, table.top),
-            Vec2(table.left, table.bottom),
-            Vec2(table.centerX(), table.bottom),
-            Vec2(table.right, table.bottom)
-        )
 
         val detectedBalls = findBalls(bitmap, table, sample)
         val balls = smoothBalls(detectedBalls)
@@ -77,6 +69,17 @@ object PoolTracker {
             ?: balls.map { it.radius }.average().toFloat()
                 .takeIf { it.isFinite() && it > 2f }
             ?: table.width() * 0.014f
+
+        // Place pocket guides inside the felt boundary, not on its outer edge.
+        val inset = radius * 0.85f
+        val pockets = listOf(
+            Vec2(table.left + inset, table.top + inset),
+            Vec2(table.centerX(), table.top + inset * 0.65f),
+            Vec2(table.right - inset, table.top + inset),
+            Vec2(table.left + inset, table.bottom - inset),
+            Vec2(table.centerX(), table.bottom - inset * 0.65f),
+            Vec2(table.right - inset, table.bottom - inset)
+        )
 
         val angle = findCueAngle(bitmap, cue, balls, table)
         val power = 0.65f
