@@ -45,10 +45,15 @@ class CaptureService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var projectionManager: MediaProjectionManager
+    private lateinit var displayManager: DisplayManager
     private var mediaProjection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
+    private var captureWidth = 0
+    private var captureHeight = 0
+    private var captureDensity = 0
     private var overlayView: TrajectoryOverlayView? = null
 
     private val workerThread = HandlerThread("PoolVisionThread").apply { start() }
@@ -61,6 +66,7 @@ class CaptureService : Service() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         projectionManager = getSystemService(MediaProjectionManager::class.java)
+        displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         workerHandler = Handler(workerThread.looper)
         createNotificationChannel()
         promoteToForeground()
@@ -107,11 +113,12 @@ class CaptureService : Service() {
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
 
-        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        captureWidth = metrics.widthPixels
+        captureHeight = metrics.heightPixels
+        captureDensity = metrics.densityDpi
+
+        val reader = createImageReader(captureWidth, captureHeight)
         imageReader = reader
 
         val projection = projectionManager.getMediaProjection(resultCode, dataIntent)
@@ -119,6 +126,10 @@ class CaptureService : Service() {
 
         val callback = object : MediaProjection.Callback() {
             override fun onStop() {
+                displayListener?.let {
+                    displayManager.unregisterDisplayListener(it)
+                }
+                displayListener = null
                 virtualDisplay?.release()
                 virtualDisplay = null
                 imageReader?.close()
@@ -127,51 +138,120 @@ class CaptureService : Service() {
                 stopSelf()
             }
         }
+
         projection.registerCallback(callback, workerHandler)
         projectionCallback = callback
 
-        val display = projection.createVirtualDisplay(
+        virtualDisplay = projection.createVirtualDisplay(
             "SpotifyPoolCapture",
-            width,
-            height,
-            density,
+            captureWidth,
+            captureHeight,
+            captureDensity,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface,
             null,
             workerHandler
         )
-        virtualDisplay = display
+
+        registerDisplayListener()
+    }
+
+    private fun createImageReader(width: Int, height: Int): ImageReader {
+        val reader = ImageReader.newInstance(
+            width,
+            height,
+            PixelFormat.RGBA_8888,
+            2
+        )
 
         reader.setOnImageAvailableListener({ ir ->
             val image = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
                 val plane = image.planes[0]
-                val rowStride = plane.rowStride
-                val pixelStride = plane.pixelStride
+                val rawWidth = plane.rowStride / plane.pixelStride
+                val frameWidth = image.width
+                val frameHeight = image.height
                 val buffer = plane.buffer
                 buffer.rewind()
 
-                val rawWidth = rowStride / pixelStride
-                val bmp = Bitmap.createBitmap(rawWidth, image.height, Bitmap.Config.ARGB_8888)
+                val bmp = Bitmap.createBitmap(
+                    rawWidth,
+                    frameHeight,
+                    Bitmap.Config.ARGB_8888
+                )
                 bmp.copyPixelsFromBuffer(buffer)
 
-                val cropped = if (rawWidth != width) {
-                    Bitmap.createBitmap(bmp, 0, 0, width, image.height).also {
-                        if (it != bmp) bmp.recycle()
+                val cropWidth = minOf(frameWidth, rawWidth)
+                val cropped = if (rawWidth != cropWidth) {
+                    Bitmap.createBitmap(bmp, 0, 0, cropWidth, frameHeight).also {
+                        bmp.recycle()
                     }
                 } else {
                     bmp
                 }
 
-                val plan = PoolTracker.analyzeFrame(cropped, SAMPLE_STEP_PX)
-                if (!cropped.isRecycled) cropped.recycle()
-
-                latestPlan = plan
-                overlayView?.postInvalidate()
+                try {
+                    latestPlan = PoolTracker.analyzeFrame(cropped, SAMPLE_STEP_PX)
+                    overlayView?.postInvalidate()
+                } finally {
+                    if (!cropped.isRecycled) cropped.recycle()
+                }
             } finally {
                 image.close()
             }
         }, workerHandler)
+
+        return reader
+    }
+
+    private fun registerDisplayListener() {
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = Unit
+            override fun onDisplayRemoved(displayId: Int) = Unit
+
+            override fun onDisplayChanged(displayId: Int) {
+                @Suppress("DEPRECATION")
+                val defaultDisplayId = windowManager.defaultDisplay.displayId
+                if (displayId == defaultDisplayId) {
+                    refreshCaptureSize()
+                }
+            }
+        }
+
+        displayListener = listener
+        displayManager.registerDisplayListener(listener, workerHandler)
+    }
+
+    private fun refreshCaptureSize() {
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+
+        val newWidth = metrics.widthPixels
+        val newHeight = metrics.heightPixels
+        val newDensity = metrics.densityDpi
+
+        if (newWidth == captureWidth &&
+            newHeight == captureHeight &&
+            newDensity == captureDensity
+        ) {
+            return
+        }
+
+        val newReader = createImageReader(newWidth, newHeight)
+        val oldReader = imageReader
+
+        virtualDisplay?.resize(newWidth, newHeight, newDensity)
+        virtualDisplay?.setSurface(newReader.surface)
+
+        imageReader = newReader
+        captureWidth = newWidth
+        captureHeight = newHeight
+        captureDensity = newDensity
+
+        oldReader?.close()
+        latestPlan = null
+        overlayView?.postInvalidate()
     }
 
     private fun attachOverlay() {
@@ -214,6 +294,8 @@ class CaptureService : Service() {
             mediaProjection?.unregisterCallback(callback)
         }
         projectionCallback = null
+        displayListener?.let { displayManager.unregisterDisplayListener(it) }
+        displayListener = null
         virtualDisplay?.release()
         mediaProjection?.stop()
         imageReader?.close()
