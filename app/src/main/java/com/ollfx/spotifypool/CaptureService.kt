@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -19,9 +20,11 @@ import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.View
@@ -30,8 +33,11 @@ import android.view.WindowManager
 class CaptureService : Service() {
 
     companion object {
+        const val ACTION_START = "com.ollfx.spotifypool.action.START"
+        const val ACTION_STOP = "com.ollfx.spotifypool.action.STOP"
         const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_DATA_INTENT = "data_intent"
+        const val EXTRA_DATA = "data_intent"
+        const val EXTRA_DATA_INTENT = EXTRA_DATA
         private const val CHANNEL_ID = "spotify_pool_overlay"
         private const val NOTIFICATION_ID = 1042
         private const val SAMPLE_STEP_PX = 4
@@ -40,6 +46,7 @@ class CaptureService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var projectionManager: MediaProjectionManager
     private var mediaProjection: MediaProjection? = null
+    private var projectionCallback: MediaProjection.Callback? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var overlayView: TrajectoryOverlayView? = null
@@ -56,14 +63,39 @@ class CaptureService : Service() {
         projectionManager = getSystemService(MediaProjectionManager::class.java)
         workerHandler = Handler(workerThread.looper)
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
-        attachOverlay()
+        promoteToForeground()
+        if (Settings.canDrawOverlays(this)) attachOverlay()
+    }
+
+    private fun promoteToForeground() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
             ?: Activity.RESULT_CANCELED
-        val dataIntent = intent?.getParcelableExtra<Intent>(EXTRA_DATA_INTENT)
+        val dataIntent: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+                ?: intent?.getParcelableExtra(EXTRA_DATA_INTENT, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra(EXTRA_DATA)
+                ?: intent?.getParcelableExtra(EXTRA_DATA_INTENT)
+        }
 
         if (resultCode == Activity.RESULT_OK && dataIntent != null && mediaProjection == null) {
             setupProjection(resultCode, dataIntent)
@@ -84,6 +116,19 @@ class CaptureService : Service() {
 
         val projection = projectionManager.getMediaProjection(resultCode, dataIntent)
         mediaProjection = projection
+
+        val callback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                virtualDisplay?.release()
+                virtualDisplay = null
+                imageReader?.close()
+                imageReader = null
+                mediaProjection = null
+                stopSelf()
+            }
+        }
+        projection.registerCallback(callback, workerHandler)
+        projectionCallback = callback
 
         val display = projection.createVirtualDisplay(
             "SpotifyPoolCapture",
@@ -165,6 +210,10 @@ class CaptureService : Service() {
     }
 
     override fun onDestroy() {
+        projectionCallback?.let { callback ->
+            mediaProjection?.unregisterCallback(callback)
+        }
+        projectionCallback = null
         virtualDisplay?.release()
         mediaProjection?.stop()
         imageReader?.close()
