@@ -362,10 +362,20 @@ class CaptureService : Service() {
 
             val save = canvas.save()
 
-            // Map captured frame directly onto the full-screen overlay.
-            // No aspect-fit letterboxing or artificial centre offsets.
-            val scaleX = width.toFloat() / plan.frameWidth.toFloat()
-            val scaleY = height.toFloat() / plan.frameHeight.toFloat()
+            // Map capture coordinates into the overlay's actual screen position.
+            val screenLocation = IntArray(2)
+            getLocationOnScreen(screenLocation)
+
+            val displayWidth = captureWidth.takeIf { it > 0 } ?: plan.frameWidth
+            val displayHeight = captureHeight.takeIf { it > 0 } ?: plan.frameHeight
+
+            canvas.translate(
+                -screenLocation[0].toFloat(),
+                -screenLocation[1].toFloat()
+            )
+
+            val scaleX = displayWidth.toFloat() / plan.frameWidth.toFloat()
+            val scaleY = displayHeight.toFloat() / plan.frameHeight.toFloat()
             canvas.scale(scaleX, scaleY)
 
             for (ball in plan.balls) {
