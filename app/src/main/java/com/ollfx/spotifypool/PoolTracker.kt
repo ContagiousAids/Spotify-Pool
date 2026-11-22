@@ -188,7 +188,8 @@ object PoolTracker {
                 ),
                 balls = engineBalls,
                 pockets = enginePockets,
-                cueBallId = cueIndex
+                cueBallId = cueIndex,
+                preferredAngle = angle.toFloat()
             )
         } else null
 
@@ -526,11 +527,11 @@ object PoolTracker {
     ): Double {
         if (cue == null) return 0.0
 
-        val range = cue.radius * 7f
+        val range = cue.radius * 8.5f
         val hsv = FloatArray(3)
         var sx = 0.0
         var sy = 0.0
-        var weights = 0.0
+        var weightTotal = 0.0
 
         val x0 = max(0, (cue.center.x - range).toInt())
         val x1 = min(bitmap.width, (cue.center.x + range).toInt())
@@ -545,24 +546,34 @@ object PoolTracker {
                 val dy = y - cue.center.y
                 val distance = hypot(dx, dy)
 
-                if (distance > cue.radius * 1.5f && distance < range) {
-                    Color.colorToHSV(bitmap.getPixel(x, y), hsv)
-                    val warm = (hsv[0] in 12f..58f || hsv[0] in 325f..360f) &&
-                        hsv[1] > 0.30f && hsv[2] > 0.30f
+                if (distance > cue.radius * 1.45f && distance < range) {
+                    val insideOtherBall = balls.any {
+                        it !== cue &&
+                            hypot(it.center.x - x, it.center.y - y) < it.radius * 1.25f
+                    }
 
-                    if (warm) {
-                        sx += dx * distance
-                        sy += dy * distance
-                        weights += distance
+                    if (!insideOtherBall) {
+                        Color.colorToHSV(bitmap.getPixel(x, y), hsv)
+
+                        // The in-game aiming guide is bright and nearly white.
+                        if (hsv[1] < 0.28f && hsv[2] > 0.72f) {
+                            val weight = 1.0 / (1.0 + distance / cue.radius)
+                            sx += dx * weight
+                            sy += dy * weight
+                            weightTotal += weight
+                        }
                     }
                 }
-                x += 3
+                x += 2
             }
-            y += 3
+            y += 2
         }
 
-        if (weights > 0.0) return atan2(sy, sx) + PI
+        if (weightTotal > 0.0 && hypot(sx, sy) > 0.001) {
+            return atan2(sy, sx)
+        }
 
+        // Fallback when the game guide is not visible.
         val target = balls.filter { it !== cue }.minByOrNull {
             hypot(it.center.x - cue.center.x, it.center.y - cue.center.y)
         }
@@ -572,9 +583,7 @@ object PoolTracker {
                 (target.center.y - cue.center.y).toDouble(),
                 (target.center.x - cue.center.x).toDouble()
             )
-        } else {
-            0.0
-        }
+        } else 0.0
     }
 
     private fun trace(

@@ -72,7 +72,8 @@ class PoolPhysicsEngine {
         table: PoolEngineRect,
         balls: List<PoolEngineBall>,
         pockets: List<PoolEnginePocket>,
-        cueBallId: Int
+        cueBallId: Int,
+        preferredAngle: Float? = null
     ): PoolEngineShotPlan? {
         val cue = balls.firstOrNull { it.id == cueBallId } ?: balls.firstOrNull { it.isCueBall } ?: return null
         val objects = balls.filter { it.id != cue.id && it.radius > 0f }
@@ -95,7 +96,21 @@ class PoolPhysicsEngine {
                     val cutPenalty = (1f - cutCos).coerceAtLeast(0f) * 85f
                     val bankPenalty = route.bankCount * 95f
                     val totalLength = cueDistance + route.length
-                    val score = totalLength + cutPenalty + bankPenalty
+                    val candidateAngle = kotlin.math.atan2(
+                        (contact.y - cue.center.y).toDouble(),
+                        (contact.x - cue.center.x).toDouble()
+                    )
+                    val aimPenalty = preferredAngle?.let { aim ->
+                        val difference = candidateAngle - aim.toDouble()
+                        kotlin.math.abs(
+                            kotlin.math.atan2(
+                                kotlin.math.sin(difference),
+                                kotlin.math.cos(difference)
+                            )
+                        ).toFloat() * table.width * 2.5f
+                    } ?: 0f
+
+                    val score = totalLength + cutPenalty + bankPenalty + aimPenalty
 
                     val cueSegments = listOf(PoolEngineSegment(cue.center, contact))
                     val objectSegments = route.points.zipWithNext().map { PoolEngineSegment(it.first, it.second) }
