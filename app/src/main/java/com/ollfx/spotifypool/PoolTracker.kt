@@ -162,7 +162,11 @@ object PoolTracker {
             frameHeight = h
         )
 
-        // Keep the player's actual aiming direction. Do not replace it with a globally optimised shot.\n        return basePlan\n    }\n\n    private fun findTable(bitmap: Bitmap, step: Int): RectF {
+        // Preserve the player's actual aiming direction.
+        return basePlan
+    }
+
+    private fun findTable(bitmap: Bitmap, step: Int): RectF {
         val w = bitmap.width
         val h = bitmap.height
         val cols = (w + step - 1) / step
