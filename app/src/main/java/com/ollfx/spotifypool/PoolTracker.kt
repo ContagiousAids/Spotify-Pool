@@ -162,81 +162,7 @@ object PoolTracker {
             frameHeight = h
         )
 
-        // Calculate a geometrically valid pot using the physics engine.
-        val engineBalls = balls.mapIndexed { index, ball ->
-            PoolEngineBall(
-                id = index,
-                center = PoolEnginePoint(ball.center.x, ball.center.y),
-                radius = ball.radius,
-                isCueBall = ball.isCueBall
-            )
-        }
-
-        val enginePockets = pockets.mapIndexed { index, pocket ->
-            PoolEnginePocket(
-                id = index,
-                center = PoolEnginePoint(pocket.x, pocket.y),
-                captureRadius = radius * 2.2f
-            )
-        }
-
-        val cueIndex = balls.indexOfFirst { it.isCueBall }
-        val physicsShot = if (cueIndex >= 0) {
-            PoolPhysicsEngine().calculateBestShot(
-                table = PoolEngineRect(
-                    table.left, table.top, table.right, table.bottom
-                ),
-                balls = engineBalls,
-                pockets = enginePockets,
-                cueBallId = cueIndex,
-                preferredAngle = angle.toFloat()
-            )
-        } else null
-
-        // Keep the existing tracker paths if no valid pot is found.
-        return physicsShot?.let { shot ->
-            val target = balls.getOrNull(shot.targetBallId)
-
-            basePlan.copy(
-                angleDeg = target?.let {
-                    Math.toDegrees(
-                        atan2(
-                            shot.contactPoint.y - cue!!.center.y,
-                            shot.contactPoint.x - cue.center.x
-                        ).toDouble()
-                    ).toFloat()
-                } ?: basePlan.angleDeg,
-                powerRatio = shot.estimatedPower,
-                cueSegments = shot.cuePath.map {
-                    TrajectorySegment(
-                        Vec2(it.start.x, it.start.y),
-                        Vec2(it.end.x, it.end.y),
-                        false
-                    )
-                },
-                impactPoint = Vec2(
-                    shot.contactPoint.x, shot.contactPoint.y
-                ),
-                hitBall = target,
-                deflectedCueSegments = shot.deflectedCuePath.map {
-                    TrajectorySegment(
-                        Vec2(it.start.x, it.start.y),
-                        Vec2(it.end.x, it.end.y),
-                        false
-                    )
-                },
-                objectSegments = shot.objectPath.mapIndexed { index, segment ->
-                    TrajectorySegment(
-                        Vec2(segment.start.x, segment.start.y),
-                        Vec2(segment.end.x, segment.end.y),
-                        shot.bankCount > 0 && index == 0
-                    )
-                }
-            )
-        } ?: basePlan
-    }
-
-    private fun findTable(bitmap: Bitmap, step: Int): RectF {
+        // Keep the player's actual aiming direction. Do not replace it with a globally optimised shot.\n        return basePlan\n    }\n\n    private fun findTable(bitmap: Bitmap, step: Int): RectF {
         val w = bitmap.width
         val h = bitmap.height
         val cols = (w + step - 1) / step
@@ -519,6 +445,10 @@ object PoolTracker {
         return result
     }
 
+    /**
+     * Detects the actual white aiming guide by following continuous bright
+     * pixels in narrow corridors radiating from the cue ball.
+     */
     private fun findCueAngle(
         bitmap: Bitmap,
         cue: DetectedBall?,
@@ -527,63 +457,93 @@ object PoolTracker {
     ): Double {
         if (cue == null) return 0.0
 
-        val range = cue.radius * 8.5f
+        val radius = cue.radius.coerceAtLeast(2f)
+        val firstDistance = radius * 1.35f
+        val lastDistance = radius * 10f
+        val distanceStep = max(2f, radius * 0.35f)
+        val offsets = floatArrayOf(-0.22f, 0f, 0.22f)
         val hsv = FloatArray(3)
-        var sx = 0.0
-        var sy = 0.0
-        var weightTotal = 0.0
 
-        val x0 = max(0, (cue.center.x - range).toInt())
-        val x1 = min(bitmap.width, (cue.center.x + range).toInt())
-        val y0 = max(0, (cue.center.y - range).toInt())
-        val y1 = min(bitmap.height, (cue.center.y + range).toInt())
+        var bestAngle = Double.NaN
+        var bestScore = 0.0
 
-        var y = y0
-        while (y < y1) {
-            var x = x0
-            while (x < x1) {
-                val dx = x - cue.center.x
-                val dy = y - cue.center.y
-                val distance = hypot(dx, dy)
+        for (degree in -180..179) {
+            val angle = Math.toRadians(degree.toDouble())
+            val ux = cos(angle).toFloat()
+            val uy = sin(angle).toFloat()
+            var hits = 0
+            var longestRun = 0
+            var run = 0
+            var nearHits = 0
+            var distance = firstDistance
 
-                if (distance > cue.radius * 1.45f && distance < range) {
-                    val insideOtherBall = balls.any {
-                        it !== cue &&
-                            hypot(it.center.x - x, it.center.y - y) < it.radius * 1.25f
-                    }
+            while (distance <= lastDistance) {
+                val px = cue.center.x + ux * distance
+                val py = cue.center.y + uy * distance
+                if (!table.contains(px, py)) break
 
-                    if (!insideOtherBall) {
-                        Color.colorToHSV(bitmap.getPixel(x, y), hsv)
+                var foundPixel = false
 
-                        // The in-game aiming guide is bright and nearly white.
-                        if (hsv[1] < 0.28f && hsv[2] > 0.72f) {
-                            val weight = 1.0 / (1.0 + distance / cue.radius)
-                            sx += dx * weight
-                            sy += dy * weight
-                            weightTotal += weight
-                        }
+                for (offset in offsets) {
+                    val x = (px - uy * radius * offset).toInt()
+                    val y = (py + ux * radius * offset).toInt()
+
+                    if (x !in 0 until bitmap.width ||
+                        y !in 0 until bitmap.height) continue
+
+                    if (balls.any { ball ->
+                        ball !== cue &&
+                            hypot(ball.center.x - x, ball.center.y - y) <
+                            ball.radius * 0.92f
+                    }) continue
+
+                    Color.colorToHSV(bitmap.getPixel(x, y), hsv)
+
+                    if (hsv[1] < 0.30f && hsv[2] > 0.76f) {
+                        foundPixel = true
+                        break
                     }
                 }
-                x += 2
+
+                if (foundPixel) {
+                    hits++
+                    run++
+                    longestRun = max(longestRun, run)
+                    if (distance <= radius * 4.5f) nearHits++
+                } else {
+                    run = 0
+                }
+
+                distance += distanceStep
             }
-            y += 2
+
+            val continuity = longestRun.toDouble() / max(1, hits)
+            val score = hits * (0.65 + continuity * 0.35) +
+                nearHits * 0.45
+
+            if (hits >= 3 && score > bestScore) {
+                bestScore = score
+                bestAngle = angle
+            }
         }
 
-        if (weightTotal > 0.0 && hypot(sx, sy) > 0.001) {
-            return atan2(sy, sx)
+        if (!bestAngle.isNaN() && bestScore >= 3.0) {
+            return bestAngle
         }
 
-        // Fallback when the game guide is not visible.
-        val target = balls.filter { it !== cue }.minByOrNull {
-            hypot(it.center.x - cue.center.x, it.center.y - cue.center.y)
-        }
+        // Fallback if the game aiming guide is not visible.
+        val target = balls.asSequence()
+            .filter { it !== cue }
+            .minByOrNull {
+                hypot(it.center.x - cue.center.x, it.center.y - cue.center.y)
+            }
 
-        return if (target != null) {
+        return target?.let {
             atan2(
-                (target.center.y - cue.center.y).toDouble(),
-                (target.center.x - cue.center.x).toDouble()
+                (it.center.y - cue.center.y).toDouble(),
+                (it.center.x - cue.center.x).toDouble()
             )
-        } else 0.0
+        } ?: 0.0
     }
 
     private fun trace(
