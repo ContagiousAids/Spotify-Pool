@@ -366,83 +366,52 @@ object PoolTracker {
         val rows = max(1, (bottom - top + step - 1) / step)
 
         val hsv = FloatArray(3)
-        val hueHistogram = IntArray(360)
+        val histogram = IntArray(360)
 
-        // Learn the dominant felt hue from the table itself.
+        // Determine the dominant blue/green felt hue.
         for (y in 0 until rows step 2) {
             for (x in 0 until cols step 2) {
                 Color.colorToHSV(
                     bitmap.getPixel(
                         min(bitmap.width - 1, left + x * step),
                         min(bitmap.height - 1, top + y * step)
-                    ),
-                    hsv
+                    ), hsv
                 )
-                if (hsv[1] > 0.25f && hsv[2] > 0.15f) {
-                    hueHistogram[hsv[0].toInt().coerceIn(0, 359)]++
+                if (hsv[1] > 0.25f && hsv[2] > 0.20f) {
+                    histogram[hsv[0].toInt().coerceIn(0, 359)]++
                 }
             }
         }
 
-        val feltHue = hueHistogram.indices.maxByOrNull {
-            hueHistogram[it]
-        }?.toFloat() ?: 120f
-
-        var saturationTotal = 0f
-        var valueTotal = 0f
-        var feltSamples = 0
-
-        for (y in 0 until rows step 2) {
-            for (x in 0 until cols step 2) {
-                Color.colorToHSV(
-                    bitmap.getPixel(
-                        min(bitmap.width - 1, left + x * step),
-                        min(bitmap.height - 1, top + y * step)
-                    ),
-                    hsv
-                )
-                val difference = min(
-                    abs(hsv[0] - feltHue),
-                    360f - abs(hsv[0] - feltHue)
-                )
-                if (difference < 18f && hsv[1] > 0.20f) {
-                    saturationTotal += hsv[1]
-                    valueTotal += hsv[2]
-                    feltSamples++
-                }
-            }
-        }
-
-        val feltSat = if (feltSamples > 0) saturationTotal / feltSamples else 0.5f
-        val feltValue = if (feltSamples > 0) valueTotal / feltSamples else 0.5f
+        val feltHue = histogram.indices.maxByOrNull { histogram[it] }?.toFloat() ?: 190f
 
         val mask = BooleanArray(cols * rows)
-        val cueMask = BooleanArray(cols * rows)
+        val whiteMask = BooleanArray(cols * rows)
 
+        // Keep ball-coloured pixels, not every pixel that differs slightly
+        // from the felt. This prevents felt texture becoming one giant blob.
         for (y in 0 until rows) {
             for (x in 0 until cols) {
                 Color.colorToHSV(
                     bitmap.getPixel(
                         min(bitmap.width - 1, left + x * step),
                         min(bitmap.height - 1, top + y * step)
-                    ),
-                    hsv
+                    ), hsv
                 )
 
-                val hueDifference = min(
+                val hueDiff = min(
                     abs(hsv[0] - feltHue),
                     360f - abs(hsv[0] - feltHue)
                 )
 
-                // A pixel is felt only when its hue, saturation and brightness
-                // are sufficiently close to the learned table colour.
-                val isFelt = hueDifference < 18f &&
-                    abs(hsv[1] - feltSat) < 0.28f &&
-                    abs(hsv[2] - feltValue) < 0.32f
+                val white = hsv[1] < 0.24f && hsv[2] > 0.72f
+                val coloured = hueDiff > 24f &&
+                    hsv[1] > 0.28f &&
+                    hsv[2] > 0.28f
 
                 val index = y * cols + x
-                mask[index] = !isFelt && hsv[2] > 0.08f
-                cueMask[index] = hsv[1] < 0.23f && hsv[2] > 0.68f
+                whiteMask[index] = white
+                mask[index] = white || coloured
             }
         }
 
@@ -451,8 +420,8 @@ object PoolTracker {
         val found = ArrayList<DetectedBall>()
 
         val expectedRadius = table.width() * 0.014f
-        val minRadius = max(3f, expectedRadius * 0.35f)
-        val maxRadius = expectedRadius * 2.5f
+        val minRadius = max(3f, expectedRadius * 0.45f)
+        val maxRadius = expectedRadius * 1.65f
 
         for (startIndex in mask.indices) {
             if (!mask[startIndex] || visited[startIndex]) continue
@@ -462,9 +431,9 @@ object PoolTracker {
             visited[startIndex] = true
 
             var count = 0
+            var whiteCount = 0
             var sumX = 0f
             var sumY = 0f
-            var whiteCount = 0
             var minX = cols
             var maxX = 0
             var minY = rows
@@ -478,12 +447,12 @@ object PoolTracker {
                 count++
                 sumX += (left + x * step).toFloat()
                 sumY += (top + y * step).toFloat()
+                if (whiteMask[index]) whiteCount++
+
                 minX = min(minX, x)
                 maxX = max(maxX, x)
                 minY = min(minY, y)
                 maxY = max(maxY, y)
-
-                if (cueMask[index]) whiteCount++
 
                 for (dy in -1..1) {
                     for (dx in -1..1) {
@@ -493,7 +462,7 @@ object PoolTracker {
                         if (nx !in 0 until cols || ny !in 0 until rows) continue
 
                         val next = ny * cols + nx
-                        if (!mask[next] || visited[next]) continue
+                        if (visited[next] || !mask[next]) continue
 
                         visited[next] = true
                         queue.add(next)
@@ -501,13 +470,12 @@ object PoolTracker {
                 }
             }
 
-            if (count < 3 || count > 700) continue
+            if (count < 5) continue
 
             val boxW = (maxX - minX + 1) * step
             val boxH = (maxY - minY + 1) * step
             val aspect = boxW.toFloat() / max(1, boxH)
-
-            if (aspect !in 0.45f..2.2f) continue
+            if (aspect !in 0.60f..1.55f) continue
 
             val area = count * step * step
             val radius = sqrt(area / PI).toFloat()
@@ -518,7 +486,7 @@ object PoolTracker {
                     center = Vec2(sumX / count, sumY / count),
                     radius = radius,
                     areaPx = area,
-                    isCueBall = whiteCount > count * 0.35f
+                    isCueBall = whiteCount > count * 0.45f
                 )
             )
         }
