@@ -311,44 +311,44 @@ class CaptureService : Service() {
 
     private inner class TrajectoryOverlayView(context: Context) : View(context) {
         private val cueSolidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
+            color = Color.MAGENTA
             strokeWidth = 3f
             style = Paint.Style.STROKE
         }
 
         private val cueBouncePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.CYAN
+            color = Color.MAGENTA
             strokeWidth = 2.5f
             style = Paint.Style.STROKE
             pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
         }
 
         private val objectAimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.YELLOW
+            color = Color.MAGENTA
             strokeWidth = 3f
             style = Paint.Style.STROKE
         }
 
         private val pocketRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.GREEN
+            color = Color.MAGENTA
             strokeWidth = 2f
             style = Paint.Style.STROKE
         }
 
         private val ballMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(190, 0, 255, 180)
+            color = Color.MAGENTA
             strokeWidth = 2f
             style = Paint.Style.STROKE
         }
 
         private val ghostBallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
+            color = Color.MAGENTA
             strokeWidth = 3f
             style = Paint.Style.STROKE
         }
 
         private val hudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
+            color = Color.MAGENTA
             textSize = 22f
             setShadowLayer(4f, 1f, 1f, Color.BLACK)
         }

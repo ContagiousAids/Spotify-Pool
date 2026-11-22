@@ -308,7 +308,9 @@ object PoolTracker {
                         min(bitmap.height - 1, top + y * step)
                     ), hsv
                 )
-                if (hsv[1] > 0.25f && hsv[2] > 0.20f) {
+                val overlayInk = hsv[0] in 294f..306f &&
+                    hsv[1] > 0.65f && hsv[2] > 0.65f
+                if (!overlayInk && hsv[1] > 0.25f && hsv[2] > 0.20f) {
                     histogram[hsv[0].toInt().coerceIn(0, 359)]++
                 }
             }
@@ -335,8 +337,13 @@ object PoolTracker {
                     360f - abs(hsv[0] - feltHue)
                 )
 
-                val white = hsv[1] < 0.24f && hsv[2] > 0.72f
-                val coloured = hueDiff > 24f &&
+                val overlayInk = hsv[0] in 294f..306f &&
+                    hsv[1] > 0.65f && hsv[2] > 0.65f
+
+                val white = !overlayInk &&
+                    hsv[1] < 0.24f && hsv[2] > 0.72f
+                val coloured = !overlayInk &&
+                    hueDiff > 24f &&
                     hsv[1] > 0.28f &&
                     hsv[2] > 0.28f
 
@@ -453,6 +460,11 @@ object PoolTracker {
      * Detects the actual white aiming guide by following continuous bright
      * pixels in narrow corridors radiating from the cue ball.
      */
+    /**
+     * Finds the game's real aiming guide by testing complete rays from the
+     * cue ball. A valid ray must contain a continuous sequence of bright,
+     * low-saturation pixels and should terminate at the first ball it meets.
+     */
     private fun findCueAngle(
         bitmap: Bitmap,
         cue: DetectedBall?,
@@ -462,84 +474,161 @@ object PoolTracker {
         if (cue == null) return 0.0
 
         val radius = cue.radius.coerceAtLeast(2f)
-        val firstDistance = radius * 1.35f
-        val lastDistance = radius * 10f
-        val distanceStep = max(2f, radius * 0.35f)
-        val offsets = floatArrayOf(-0.22f, 0f, 0.22f)
+        val firstDistance = radius * 1.30f
+        val distanceStep = max(2f, radius * 0.22f)
+        val maxDistance = table.width() + table.height()
+        val offsets = floatArrayOf(-0.18f, 0f, 0.18f)
         val hsv = FloatArray(3)
 
-        var bestAngle = Double.NaN
-        var bestScore = 0.0
-
-        for (degree in -180..179) {
-            val angle = Math.toRadians(degree.toDouble())
+        fun scoreDirection(angle: Double): Double {
             val ux = cos(angle).toFloat()
             val uy = sin(angle).toFloat()
-            var hits = 0
-            var longestRun = 0
-            var run = 0
-            var nearHits = 0
+
+            // Find the first detected ball intersected by this ray.
+            val stopAtBall = balls.asSequence()
+                .filter { it !== cue }
+                .mapNotNull { ball ->
+                    val rx = ball.center.x - cue.center.x
+                    val ry = ball.center.y - cue.center.y
+                    val along = rx * ux + ry * uy
+                    val across = abs(rx * uy - ry * ux)
+
+                    if (along > radius * 1.2f &&
+                        across < radius + ball.radius * 0.90f
+                    ) {
+                        (along - ball.radius * 0.45f)
+                            .coerceAtLeast(firstDistance)
+                    } else {
+                        null
+                    }
+                }
+                .minOrNull() ?: maxDistance
+
+            val rayLimit = min(maxDistance, stopAtBall)
+
             var distance = firstDistance
+            var sampleCount = 0
+            var hits = 0
+            var run = 0
+            var gap = 0
+            var longestRun = 0
+            var nearHits = 0
+            var firstHitDistance = Float.POSITIVE_INFINITY
 
-            while (distance <= lastDistance) {
-                val px = cue.center.x + ux * distance
-                val py = cue.center.y + uy * distance
-                if (!table.contains(px, py)) break
+            while (distance < rayLimit) {
+                val centerX = cue.center.x + ux * distance
+                val centerY = cue.center.y + uy * distance
 
-                var foundPixel = false
+                if (!table.contains(centerX, centerY)) break
+
+                sampleCount++
+                var brightPixel = false
 
                 for (offset in offsets) {
-                    val x = (px - uy * radius * offset).toInt()
-                    val y = (py + ux * radius * offset).toInt()
+                    val px = centerX - uy * radius * offset
+                    val py = centerY + ux * radius * offset
+                    val x = px.toInt()
+                    val y = py.toInt()
 
                     if (x !in 0 until bitmap.width ||
-                        y !in 0 until bitmap.height) continue
+                        y !in 0 until bitmap.height
+                    ) continue
 
-                    if (balls.any { ball ->
+                    // Do not mistake another ball's highlight for the guide.
+                    val insideBall = balls.any { ball ->
                         ball !== cue &&
                             hypot(ball.center.x - x, ball.center.y - y) <
-                            ball.radius * 0.92f
-                    }) continue
+                            ball.radius * 0.90f
+                    }
+                    if (insideBall) continue
 
                     Color.colorToHSV(bitmap.getPixel(x, y), hsv)
 
-                    if (hsv[1] < 0.30f && hsv[2] > 0.76f) {
-                        foundPixel = true
+                    if (hsv[1] < 0.42f && hsv[2] > 0.68f) {
+                        brightPixel = true
                         break
                     }
                 }
 
-                if (foundPixel) {
+                if (brightPixel) {
+                    if (firstHitDistance == Float.POSITIVE_INFINITY) {
+                        firstHitDistance = distance
+                    }
                     hits++
                     run++
+                    gap = 0
                     longestRun = max(longestRun, run)
-                    if (distance <= radius * 4.5f) nearHits++
+
+                    if (distance <= radius * 3.5f) nearHits++
                 } else {
-                    run = 0
+                    gap++
+                    if (gap > 2) run = 0
                 }
 
                 distance += distanceStep
             }
 
-            val continuity = longestRun.toDouble() / max(1, hits)
-            val score = hits * (0.65 + continuity * 0.35) +
-                nearHits * 0.45
+            if (sampleCount < 5) return 0.0
 
-            if (hits >= 3 && score > bestScore) {
+            val minimumHits = max(4, (sampleCount * 0.08f).toInt())
+
+            // Reject scattered highlights and isolated white pixels.
+            if (hits < minimumHits ||
+                longestRun < 3 ||
+                firstHitDistance > radius * 4.5f
+            ) {
+                return 0.0
+            }
+
+            val coverage = hits.toDouble() / sampleCount
+            val continuity = longestRun.toDouble() / sampleCount
+            val nearBonus = if (firstHitDistance <= radius * 2.8f) 18.0 else 0.0
+
+            return coverage * 100.0 +
+                continuity * 80.0 +
+                nearBonus +
+                nearHits * 0.15
+        }
+
+        var bestAngle = 0.0
+        var bestScore = 0.0
+
+        // Coarse scan across the complete circle.
+        for (degree in -180..177 step 3) {
+            val angle = Math.toRadians(degree.toDouble())
+            val score = scoreDirection(angle)
+
+            if (score > bestScore) {
                 bestScore = score
                 bestAngle = angle
             }
         }
 
-        if (!bestAngle.isNaN() && bestScore >= 3.0) {
-            return bestAngle
+        // Refine the strongest candidate in quarter-degree increments.
+        if (bestScore > 0.0) {
+            val coarseAngle = bestAngle
+
+            for (offset in -12..12) {
+                val angle = coarseAngle + Math.toRadians(offset * 0.25)
+                val score = scoreDirection(angle)
+
+                if (score > bestScore) {
+                    bestScore = score
+                    bestAngle = angle
+                }
+            }
         }
 
-        // Fallback if the game aiming guide is not visible.
+        if (bestScore >= 24.0) return bestAngle
+
+        // Fallback only when no convincing in-game guide is visible.
         val target = balls.asSequence()
             .filter { it !== cue }
             .minByOrNull {
-                hypot(it.center.x - cue.center.x, it.center.y - cue.center.y)
+                hypot(
+                    it.center.x - cue.center.x,
+                    it.center.y - cue.center.y
+                )
             }
 
         return target?.let {
