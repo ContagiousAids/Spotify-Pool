@@ -362,16 +362,11 @@ class CaptureService : Service() {
 
             val save = canvas.save()
 
-            // Preserve the captured frame's aspect ratio.
-            // Independent X/Y scaling was distorting overlay coordinates.
-            val scale = minOf(
-                width.toFloat() / plan.frameWidth.toFloat(),
-                height.toFloat() / plan.frameHeight.toFloat()
-            )
-            val offsetX = (width - plan.frameWidth * scale) / 2f
-            val offsetY = (height - plan.frameHeight * scale) / 2f
-            canvas.translate(offsetX, offsetY)
-            canvas.scale(scale, scale)
+            // Map captured frame directly onto the full-screen overlay.
+            // No aspect-fit letterboxing or artificial centre offsets.
+            val scaleX = width.toFloat() / plan.frameWidth.toFloat()
+            val scaleY = height.toFloat() / plan.frameHeight.toFloat()
+            canvas.scale(scaleX, scaleY)
 
             for (ball in plan.balls) {
                 canvas.drawCircle(
